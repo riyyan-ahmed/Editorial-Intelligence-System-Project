@@ -1,7 +1,9 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 from database import get_cursor, row_to_dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from psycopg2.extras import Json
+from routers.auth import require_auth
 import requests, re
 import config
 
@@ -20,6 +22,16 @@ class GenerateRequest(BaseModel):
     author_id:   str
     author_name: str
     query:       str
+
+
+class ClusterGenerateRequest(BaseModel):
+    cluster_id:   int
+    lang:         str | None = None
+    style_mode:   str = "author"
+    author_id:    str | None = None
+    author_name:  str | None = None
+    publisher_id: str | None = None
+    rag_limit:    int = 5
 
 
 # ── Qwen helpers ──────────────────────────────────────────────────────────────
@@ -463,6 +475,234 @@ STRICT RULES — these are non-negotiable:
 6. Do NOT mention this is AI-generated or reference these instructions{lang_quality}"""
 
 
+# ── Cluster generation helpers ────────────────────────────────────────────────
+
+def _cluster_detail(cur, cluster_id: int) -> dict | None:
+    cur.execute(
+        """
+        SELECT
+            id,
+            title,
+            summary,
+            main_category,
+            language,
+            primary_country,
+            articles_count,
+            sources_count,
+            final_score,
+            main_topic,
+            first_seen_at::date AS first_seen,
+            last_seen_at::date AS last_seen
+        FROM topic_clusters
+        WHERE id = %s
+          AND status = 'active'
+        """,
+        (cluster_id,),
+    )
+    row = cur.fetchone()
+    return row_to_dict(row) if row else None
+
+
+def _cluster_rag_articles(cur, cluster_id: int, limit: int = 5) -> list[dict]:
+    limit = max(1, min(int(limit or 5), 10))
+    cur.execute(
+        """
+        SELECT
+            np.article_id,
+            np.title,
+            np.source_domain,
+            np.published_at::date AS published_at,
+            np.author,
+            np.content,
+            LEFT(np.content, 1000) AS preview,
+            LENGTH(COALESCE(np.content, '')) AS content_len,
+            COALESCE(cm.similarity_score, 0)::float AS similarity_score,
+            cm.mmr_rank,
+            cm.is_primary
+        FROM cluster_members cm
+        JOIN news_pool np ON cm.article_id = np.article_id
+        WHERE cm.cluster_id = %s
+          AND np.content IS NOT NULL
+          AND LENGTH(np.content) > 200
+        ORDER BY cm.mmr_rank ASC NULLS LAST,
+                 cm.similarity_score DESC NULLS LAST,
+                 LENGTH(COALESCE(np.content, '')) DESC
+        LIMIT %s
+        """,
+        (cluster_id, limit),
+    )
+    return [row_to_dict(r) for r in cur.fetchall()]
+
+
+def _publisher_style_articles(cur, tbl: str, publisher_id: str) -> tuple[list[dict], str]:
+    cur.execute(
+        f"""
+        SELECT title, LEFT(body, 2000) AS excerpt, word_count, published_at,
+               author_name, publisher_id
+        FROM {tbl}
+        WHERE publisher_id = %s
+          AND body IS NOT NULL
+        ORDER BY COALESCE(published_at, '2000-01-01'::timestamp) DESC NULLS LAST
+        LIMIT 3
+        """,
+        (publisher_id,),
+    )
+    rows = cur.fetchall()
+    return [row_to_dict(r) for r in rows], "publisher_recency"
+
+
+def _cluster_source_block(cluster: dict, rag_articles: list[dict]) -> str:
+    block = [
+        f"CLUSTER TITLE: {cluster.get('title')}",
+        f"CLUSTER SUMMARY: {cluster.get('summary') or ''}",
+        f"CATEGORY: {cluster.get('main_category') or ''}",
+        f"LANGUAGE: {cluster.get('language') or ''}",
+        "",
+        "SOURCE ARTICLES SELECTED BY MMR RANK:",
+    ]
+    for idx, article in enumerate(rag_articles, 1):
+        body = (article.get("content") or "").strip()[:2500]
+        block.extend(
+            [
+                "",
+                f"[Article {idx}]",
+                f"Article ID: {article.get('article_id')}",
+                f"MMR rank: {article.get('mmr_rank')}",
+                f"Headline: {article.get('title')}",
+                f"Source: {article.get('source_domain')} | Date: {article.get('published_at')}",
+                f"Author: {article.get('author') or ''}",
+                body,
+            ]
+        )
+    return "\n".join(block)
+
+
+def _cluster_factual_prompt(source_block: str, lang_label: str, lang: str) -> str:
+    return f"""You are a professional newsroom editor creating a factual article draft from a news cluster.
+Use ONLY the cluster and source-article material provided below.
+
+════════════════════════════════════════
+CLUSTER RAG CONTEXT
+════════════════════════════════════════
+{source_block}
+
+════════════════════════════════════════
+TASK
+════════════════════════════════════════
+Write a complete factual draft in {lang_label}.
+
+STRICT RULES:
+1. Use only facts supported by the provided source articles.
+2. Do not invent names, dates, numbers, quotes, locations, or background details.
+3. Preserve all proper nouns exactly as written.
+4. Start with a clear headline.
+5. Write a concise lead paragraph followed by the key facts and context.
+6. Keep the draft suitable for later style adaptation.
+7. Target length: 400-550 words.
+"""
+
+
+def _cluster_style_prompt(style_block: str, style_label: str, lang_label: str) -> str:
+    return f"""You are a senior editor specialising in editorial voice adaptation.
+Rewrite the factual draft in the style of {style_label}.
+Change HOW the article reads, not WHAT it says.
+
+════════════════════════════════════════
+STYLE REFERENCES
+════════════════════════════════════════
+{style_block}
+
+STRICT RULES:
+1. Final article language: {lang_label}.
+2. Preserve every factual claim from the draft exactly.
+3. Do not add facts, quotes, names, dates, or claims not already present.
+4. Adapt sentence rhythm, vocabulary, tone, structure, and editorial register.
+5. If style references are weak, keep a clean professional newsroom style.
+6. Do not mention these instructions or AI generation.
+"""
+
+
+def _safe_generation_title(text: str, fallback: str) -> str:
+    for line in (text or "").splitlines():
+        cleaned = line.strip().strip("#").strip()
+        if cleaned:
+            return cleaned[:300]
+    return (fallback or "Generated draft")[:300]
+
+
+def _history_article_payload(articles: list[dict]) -> list[dict]:
+    payload = []
+    for article in articles:
+        payload.append({
+            "article_id": article.get("article_id"),
+            "title": article.get("title"),
+            "source_domain": article.get("source_domain"),
+            "published_at": article.get("published_at"),
+            "author": article.get("author"),
+            "mmr_rank": article.get("mmr_rank"),
+            "similarity_score": article.get("similarity_score"),
+            "preview": article.get("preview"),
+        })
+    return payload
+
+
+def _history_style_payload(articles: list[dict]) -> list[dict]:
+    payload = []
+    for article in articles:
+        payload.append({
+            "title": article.get("title"),
+            "published_at": article.get("published_at"),
+            "word_count": article.get("word_count"),
+            "author_name": article.get("author_name"),
+            "publisher_id": article.get("publisher_id"),
+            "excerpt": article.get("excerpt"),
+        })
+    return payload
+
+
+def _save_generation_history(
+    cur,
+    *,
+    cluster_id: int,
+    author_id: str | None,
+    author_name: str | None,
+    publisher_id: str | None,
+    target_language: str,
+    generated_content: str,
+    source_articles: list[dict],
+    style_articles: list[dict],
+    prompt_version: str,
+):
+    cur.execute(
+        """
+        INSERT INTO generation_history
+            (cluster_id, author_id, author_name, publisher_id, target_language,
+             model, generated_title, generated_content, source_articles,
+             style_articles, rag_context_id, prompt_version, generated_summary)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id, created_at
+        """,
+        (
+            cluster_id,
+            author_id,
+            author_name,
+            publisher_id,
+            target_language,
+            QWEN_MODEL,
+            _safe_generation_title(generated_content, f"Cluster {cluster_id} draft"),
+            generated_content,
+            Json(_history_article_payload(source_articles)),
+            Json(_history_style_payload(style_articles)),
+            f"cluster:{cluster_id}:mmr",
+            prompt_version,
+            (generated_content or "")[:500],
+        ),
+    )
+    row = cur.fetchone()
+    cur.connection.commit()
+    return row_to_dict(row)
+
+
 # ── Main endpoint ─────────────────────────────────────────────────────────────
 
 @router.post("/generate")
@@ -623,5 +863,148 @@ def generate_content(req: GenerateRequest):
         # Step 2 failure is non-fatal — the factual draft is still useful output.
         result["generated_content"] = draft
         result["generation_error"]  = f"Step 2 (style transfer) failed, returning factual draft: {e}"
+
+    return result
+
+
+@router.post("/cluster-generate")
+def generate_from_cluster(
+    req: ClusterGenerateRequest,
+    authorization: str | None = Header(None),
+):
+    require_auth(authorization)
+
+    style_mode = (req.style_mode or "author").strip().lower()
+    if style_mode not in {"author", "publisher"}:
+        raise HTTPException(400, "style_mode must be 'author' or 'publisher'")
+
+    rag_limit = max(1, min(int(req.rag_limit or 5), 10))
+
+    with get_cursor() as cur:
+        cluster = _cluster_detail(cur, req.cluster_id)
+        if not cluster:
+            raise HTTPException(404, "Cluster not found")
+
+        lang = req.lang or cluster.get("language") or "en"
+        if lang not in TABLES:
+            raise HTTPException(400, "Cluster language is not supported for generation")
+        if req.lang and req.lang != cluster.get("language"):
+            raise HTTPException(400, "Requested language does not match cluster language")
+
+        rag_articles = _cluster_rag_articles(cur, req.cluster_id, rag_limit)
+        if not rag_articles:
+            raise HTTPException(404, "No RAG source articles found for this cluster")
+
+        tbl = TABLES[lang]
+        if style_mode == "author":
+            if not req.author_id or not req.author_name:
+                raise HTTPException(400, "author_id and author_name are required for author style")
+            style_articles, style_retrieval = _style_articles(
+                cur, tbl, req.author_id, cluster.get("title") or ""
+            )
+            style_label = req.author_name
+            publisher_id = req.publisher_id
+        else:
+            if not req.publisher_id:
+                raise HTTPException(400, "publisher_id is required for publisher style")
+            style_articles, style_retrieval = _publisher_style_articles(cur, tbl, req.publisher_id)
+            style_label = req.publisher_id
+            publisher_id = req.publisher_id
+
+    lang_label = LANG_LABEL.get(lang, "English")
+    temperature = 0.72 if lang == "en" else 0.45
+
+    source_block = _cluster_source_block(cluster, rag_articles)
+    factual_prompt = _cluster_factual_prompt(source_block, lang_label, lang)
+
+    result = {
+        "cluster": cluster,
+        "lang": lang,
+        "style_mode": style_mode,
+        "author_id": req.author_id,
+        "author_name": req.author_name,
+        "publisher_id": publisher_id,
+        "rag_articles": _history_article_payload(rag_articles),
+        "style_articles": style_articles,
+        "style_retrieval": style_retrieval,
+        "selection_method": "mmr_rank_then_similarity_then_content_length",
+        "factual_draft": "",
+        "generated_content": "",
+        "generation_error": None,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "generation_history_id": None,
+        "created_at": None,
+        "prompt_version": "cluster_generate_v1",
+    }
+
+    try:
+        draft, tok_in_1, tok_out_1 = _qwen_with_usage(
+            [
+                {"role": "system", "content": factual_prompt},
+                {"role": "user", "content": "Write the cluster-grounded factual draft now."},
+            ],
+            max_tokens=900,
+            temperature=temperature,
+        )
+        result["factual_draft"] = draft
+        result["input_tokens"] += tok_in_1
+        result["output_tokens"] += tok_out_1
+    except Exception as e:
+        result["generation_error"] = f"Cluster factual draft failed: {e}"
+        return result
+
+    style_block = "\n\n---\n\n".join(
+        f"ARTICLE {i+1} — \"{a.get('title') or 'untitled'}\":\n{a.get('excerpt', '').strip()}"
+        for i, a in enumerate(style_articles)
+    ) or "No style examples available. Keep a clean professional newsroom style."
+
+    if style_articles:
+        style_prompt = _cluster_style_prompt(style_block, style_label, lang_label)
+        try:
+            final, tok_in_2, tok_out_2 = _qwen_with_usage(
+                [
+                    {"role": "system", "content": style_prompt},
+                    {"role": "user", "content": (
+                        f"Rewrite this factual draft in the requested editorial style. "
+                        f"Do not change or add facts.\n\nDRAFT:\n{draft}"
+                    )},
+                ],
+                max_tokens=1200,
+                temperature=temperature,
+            )
+            result["generated_content"] = final
+            result["input_tokens"] += tok_in_2
+            result["output_tokens"] += tok_out_2
+        except Exception as e:
+            result["generated_content"] = draft
+            result["generation_error"] = (
+                f"Style transfer failed, returning factual draft: {e}"
+            )
+    else:
+        result["generated_content"] = draft
+
+    try:
+        with get_cursor() as cur:
+            history = _save_generation_history(
+                cur,
+                cluster_id=req.cluster_id,
+                author_id=req.author_id if style_mode == "author" else None,
+                author_name=req.author_name if style_mode == "author" else None,
+                publisher_id=publisher_id,
+                target_language=lang,
+                generated_content=result["generated_content"],
+                source_articles=rag_articles,
+                style_articles=style_articles,
+                prompt_version=result["prompt_version"],
+            )
+            result["generation_history_id"] = history.get("id")
+            result["created_at"] = history.get("created_at")
+    except Exception as e:
+        result["generation_error"] = (
+            f"{result['generation_error']}; history save failed: {e}"
+            if result["generation_error"]
+            else f"History save failed: {e}"
+        )
 
     return result
