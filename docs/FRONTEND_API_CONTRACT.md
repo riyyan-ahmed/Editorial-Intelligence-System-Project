@@ -174,5 +174,99 @@ Returns assigned authors for the logged-in editor.
 
 ### `POST /api/evaluation/submit`
 
-Current evaluation endpoint is available. Cluster-specific feedback wiring is the next backend step after cluster generation.
+Current author-generation evaluation endpoint is still available for the original author workflow.
 
+## Generation History
+
+### `GET /api/generation/history`
+
+Returns generated drafts.
+
+Admin users see all generated drafts. Non-admin users see drafts linked to their user id.
+
+Query params:
+
+```text
+limit=50
+offset=0
+```
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "id": 2,
+      "user_id": 1,
+      "username": "admin",
+      "cluster_id": 426230,
+      "cluster_title": "...",
+      "author_id": "...",
+      "author_name": "Giles Richards",
+      "publisher_id": null,
+      "target_language": "en",
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "generated_title": "...",
+      "generated_summary": "...",
+      "prompt_version": "cluster_generate_v1",
+      "created_at": "2026-07-14",
+      "feedback_count": 1
+    }
+  ],
+  "limit": 50,
+  "offset": 0
+}
+```
+
+### `GET /api/generation/history/{generation_id}`
+
+Returns full generated draft details, source/style JSON, and feedback rows.
+
+Use this for:
+
+- draft review screen
+- history detail screen
+- feedback state display
+
+## Cluster Feedback
+
+### `POST /api/evaluation/cluster-submit`
+
+Saves editorial feedback for a cluster-generated draft.
+
+Request:
+
+```json
+{
+  "generation_history_id": 2,
+  "user_content": "Edited/corrected article text...",
+  "rating": 4,
+  "notes": "Good draft, improved lead."
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "generation_history_id": 2,
+  "evaluation_id": 3,
+  "editor_correction_id": 1,
+  "cluster_feedback_id": 1,
+  "created_at": "2026-07-14",
+  "evaluated_at": "2026-07-14",
+  "hter_score": 0.0207,
+  "chrf_score": 97.93,
+  "comet_score": null
+}
+```
+
+This endpoint writes to:
+
+- `evaluations`
+- `editor_corrections`
+- `cluster_feedback`
+
+Frontend should call this after the editor reviews or edits `generated_content`.
