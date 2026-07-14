@@ -17,6 +17,10 @@ TABLES     = {"el": "greek_author_styles", "en": "english_author_styles"}
 LANG_LABEL = {"el": "Greek (ελληνικά)",   "en": "English"}
 
 
+def _is_admin(payload: dict) -> bool:
+    return payload.get("role") == "admin"
+
+
 class GenerateRequest(BaseModel):
     lang:        str
     author_id:   str
@@ -663,6 +667,8 @@ def _history_style_payload(articles: list[dict]) -> list[dict]:
 def _save_generation_history(
     cur,
     *,
+    user_id: int | None,
+    username: str | None,
     cluster_id: int,
     author_id: str | None,
     author_name: str | None,
@@ -676,13 +682,15 @@ def _save_generation_history(
     cur.execute(
         """
         INSERT INTO generation_history
-            (cluster_id, author_id, author_name, publisher_id, target_language,
+            (user_id, username, cluster_id, author_id, author_name, publisher_id, target_language,
              model, generated_title, generated_content, source_articles,
              style_articles, rag_context_id, prompt_version, generated_summary)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         RETURNING id, created_at
         """,
         (
+            user_id,
+            username,
             cluster_id,
             author_id,
             author_name,
@@ -704,6 +712,107 @@ def _save_generation_history(
 
 
 # ── Main endpoint ─────────────────────────────────────────────────────────────
+
+@router.get("/history")
+def generation_history(
+    limit: int = 50,
+    offset: int = 0,
+    authorization: str | None = Header(None),
+):
+    payload = require_auth(authorization)
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
+
+    where = []
+    params: list = []
+    if not _is_admin(payload):
+        where.append("gh.user_id = %s")
+        params.append(int(payload["sub"]))
+
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    params.extend([limit, offset])
+
+    with get_cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                gh.id,
+                gh.user_id,
+                gh.username,
+                gh.cluster_id,
+                tc.title AS cluster_title,
+                gh.author_id,
+                gh.author_name,
+                gh.publisher_id,
+                gh.target_language,
+                gh.model,
+                gh.generated_title,
+                gh.generated_summary,
+                gh.prompt_version,
+                gh.created_at,
+                (
+                    SELECT COUNT(*)
+                    FROM cluster_feedback cf
+                    WHERE cf.generation_history_id = gh.id
+                ) AS feedback_count
+            FROM generation_history gh
+            LEFT JOIN topic_clusters tc ON tc.id = gh.cluster_id
+            {where_sql}
+            ORDER BY gh.created_at DESC NULLS LAST, gh.id DESC
+            LIMIT %s OFFSET %s
+            """,
+            tuple(params),
+        )
+        return {
+            "items": [row_to_dict(r) for r in cur.fetchall()],
+            "limit": limit,
+            "offset": offset,
+        }
+
+
+@router.get("/history/{generation_id}")
+def generation_history_detail(
+    generation_id: int,
+    authorization: str | None = Header(None),
+):
+    payload = require_auth(authorization)
+    params: list = [generation_id]
+    visibility_sql = ""
+    if not _is_admin(payload):
+        visibility_sql = "AND gh.user_id = %s"
+        params.append(int(payload["sub"]))
+
+    with get_cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                gh.*,
+                tc.title AS cluster_title,
+                tc.summary AS cluster_summary,
+                tc.main_category AS cluster_category
+            FROM generation_history gh
+            LEFT JOIN topic_clusters tc ON tc.id = gh.cluster_id
+            WHERE gh.id = %s
+            {visibility_sql}
+            """,
+            tuple(params),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Generation history item not found")
+
+        cur.execute(
+            """
+            SELECT id, rating, notes, hter_score, chrf_score, comet_score, created_at
+            FROM cluster_feedback
+            WHERE generation_history_id = %s
+            ORDER BY created_at DESC
+            """,
+            (generation_id,),
+        )
+        detail = row_to_dict(row)
+        detail["feedback"] = [row_to_dict(r) for r in cur.fetchall()]
+        return detail
 
 @router.post("/generate")
 def generate_content(req: GenerateRequest):
@@ -872,7 +981,9 @@ def generate_from_cluster(
     req: ClusterGenerateRequest,
     authorization: str | None = Header(None),
 ):
-    require_auth(authorization)
+    payload = require_auth(authorization)
+    user_id = int(payload["sub"])
+    username = payload["username"]
 
     style_mode = (req.style_mode or "author").strip().lower()
     if style_mode not in {"author", "publisher"}:
@@ -988,6 +1099,8 @@ def generate_from_cluster(
         with get_cursor() as cur:
             history = _save_generation_history(
                 cur,
+                user_id=user_id,
+                username=username,
                 cluster_id=req.cluster_id,
                 author_id=req.author_id if style_mode == "author" else None,
                 author_name=req.author_name if style_mode == "author" else None,
