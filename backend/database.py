@@ -88,4 +88,27 @@ def init_all_tables():
             )
         """)
 
+        # ── Unified generation history ownership ──────────────────────────
+        cur.execute("ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS user_id INTEGER")
+        cur.execute("ALTER TABLE generation_history ADD COLUMN IF NOT EXISTS username TEXT")
+
+        # ── Cluster feedback linked to generated drafts ───────────────────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cluster_feedback (
+                id                    SERIAL PRIMARY KEY,
+                generation_history_id INTEGER REFERENCES generation_history(id) ON DELETE SET NULL,
+                cluster_id            INTEGER,
+                user_id               INTEGER REFERENCES app_users(id) ON DELETE SET NULL,
+                username              TEXT,
+                rating                INTEGER,
+                notes                 TEXT,
+                original_content      TEXT NOT NULL,
+                edited_content        TEXT NOT NULL,
+                hter_score            FLOAT,
+                chrf_score            FLOAT,
+                comet_score           FLOAT,
+                created_at            TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
         cur.connection.commit()
