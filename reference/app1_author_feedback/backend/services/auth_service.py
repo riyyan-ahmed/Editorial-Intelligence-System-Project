@@ -37,14 +37,16 @@ def verify_token(token: str) -> dict | None:
 # ── Seeding ───────────────────────────────────────────────────────────────────
 
 def seed_users():
-    """Ensure default credentials exist. Idempotent — safe to call on every startup."""
+    """Seed demo credentials only when explicit seed passwords are provided."""
     seeds = [
-        ("admin", "admin@editorial.local", os.getenv("SEED_ADMIN_PASSWORD", "change-me-admin"), "admin"),
-        ("user1", "user1@editorial.local", os.getenv("SEED_USER1_PASSWORD", "change-me-user1"), "user"),
-        ("user2", "user2@editorial.local", os.getenv("SEED_USER2_PASSWORD", "change-me-user2"), "user"),
+        ("admin", "admin@editorial.local", os.getenv("SEED_ADMIN_PASSWORD"), "admin"),
+        ("user1", "user1@editorial.local", os.getenv("SEED_USER1_PASSWORD"), "user"),
+        ("user2", "user2@editorial.local", os.getenv("SEED_USER2_PASSWORD"), "user"),
     ]
     with get_cursor() as cur:
         for username, email, password, role in seeds:
+            if not password:
+                continue
             cur.execute("SELECT id FROM app_users WHERE username = %s", (username,))
             row = cur.fetchone()
             if row:

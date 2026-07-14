@@ -6,7 +6,7 @@ from pathlib import Path
 
 from database import init_all_tables
 from services.auth_service import seed_users
-from routers import exploration, auth, generation, evaluation
+from routers import exploration, auth, generation, evaluation, clusters
 
 # ── Startup: initialise DB tables and seed credentials ───────────────────────
 init_all_tables()
@@ -26,6 +26,7 @@ app.include_router(exploration.router, prefix="/api")
 app.include_router(auth.router,        prefix="/api")
 app.include_router(generation.router,  prefix="/api")
 app.include_router(evaluation.router,  prefix="/api")
+app.include_router(clusters.router,    prefix="/api")
 
 
 @app.get("/api/health")
