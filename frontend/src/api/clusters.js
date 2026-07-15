@@ -17,3 +17,6 @@ export const getClusterArticles = (clusterId, limit = 25) =>
 
 export const getClusterRagContext = (clusterId, limit = 5) =>
   authApi.get(`/clusters/${clusterId}/rag-context`, { params: { limit } }).then(r => r.data)
+
+export const generateClusterDraft = (payload) =>
+  authApi.post('/generation/cluster-generate', payload, { timeout: 180_000 }).then(r => r.data)

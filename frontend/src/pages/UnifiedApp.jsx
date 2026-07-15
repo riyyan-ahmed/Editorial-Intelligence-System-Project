@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Alert,
+  Autocomplete,
   Box,
   Button,
   Chip,
@@ -9,11 +10,12 @@ import {
   Divider,
   Paper,
   Stack,
+  TextField,
   ToggleButton,
   ToggleButtonGroup,
   Typography,
 } from '@mui/material'
-import OpenInNewIcon from '@mui/icons-material/OpenInNew'
+import ReactMarkdown from 'react-markdown'
 import LogoutIcon from '@mui/icons-material/Logout'
 import RefreshIcon from '@mui/icons-material/Refresh'
 import ArticleIcon from '@mui/icons-material/Article'
@@ -22,6 +24,7 @@ import TopicIcon from '@mui/icons-material/Topic'
 import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome'
 import { clearSession, getSession } from '../api/auth'
 import {
+  generateClusterDraft,
   getClusters,
   getClusterArticles,
   getClusterDetail,
@@ -29,6 +32,7 @@ import {
   getClusterSources,
   getClusterStats,
 } from '../api/clusters'
+import { getAuthors } from '../api'
 
 const WORKFLOW = [
   'Clusters',
@@ -55,21 +59,11 @@ function ClusterCard({ cluster, selected, onSelect }) {
     <Paper
       variant="outlined"
       data-testid={`cluster-card-${cluster.id}`}
-      role="button"
-      tabIndex={0}
-      onClick={() => onSelect(cluster)}
-      onKeyDown={(event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault()
-          onSelect(cluster)
-        }
-      }}
       sx={{
         p: 2,
         borderColor: selected ? '#2563eb' : cluster.pinned ? '#bfdbfe' : '#e2e8f0',
         bgcolor: cluster.pinned ? '#f8fbff' : '#fff',
         borderRadius: 2,
-        cursor: 'pointer',
         transition: 'border-color 0.15s, box-shadow 0.15s, transform 0.15s',
         boxShadow: selected ? '0 0 0 1px rgba(37,99,235,0.18)' : 'none',
         '&:hover': {
@@ -162,7 +156,160 @@ function DetailSection({ title, children, action }) {
   )
 }
 
-function ClusterDetailPanel({ selectedCluster, detailState, onContinue }) {
+function GenerationPanel({
+  selectedCluster,
+  sources,
+  authors,
+  authorsLoading,
+  generation,
+  onGenerate,
+}) {
+  const [styleMode, setStyleMode] = useState('publisher')
+  const [selectedAuthor, setSelectedAuthor] = useState(null)
+  const [selectedPublisher, setSelectedPublisher] = useState('')
+
+  const publisherOptions = useMemo(
+    () => sources.map(source => source.source_domain || source.source_name).filter(Boolean),
+    [sources],
+  )
+
+  useEffect(() => {
+    setSelectedAuthor(null)
+    setSelectedPublisher('')
+    setStyleMode('publisher')
+  }, [selectedCluster?.id])
+
+  useEffect(() => {
+    if (!selectedPublisher && publisherOptions.length > 0) {
+      setSelectedPublisher(publisherOptions[0])
+    }
+  }, [publisherOptions, selectedPublisher])
+
+  const canGenerate = selectedCluster && !generation.loading && (
+    styleMode === 'author'
+      ? Boolean(selectedAuthor?.author_id && selectedAuthor?.author_name)
+      : Boolean(selectedPublisher)
+  )
+
+  const submit = () => {
+    if (!canGenerate) return
+    const base = {
+      cluster_id: selectedCluster.id,
+      style_mode: styleMode,
+      lang: selectedCluster.language,
+      rag_limit: 5,
+    }
+    if (styleMode === 'author') {
+      onGenerate({
+        ...base,
+        author_id: selectedAuthor.author_id,
+        author_name: selectedAuthor.author_name,
+      })
+    } else {
+      onGenerate({
+        ...base,
+        publisher_id: selectedPublisher,
+      })
+    }
+  }
+
+  return (
+    <DetailSection title="Style Selection + Draft Generation">
+      <Stack spacing={2}>
+        <ToggleButtonGroup
+          exclusive
+          size="small"
+          value={styleMode}
+          onChange={(_event, value) => value && setStyleMode(value)}
+        >
+          <ToggleButton value="publisher">Publisher Style</ToggleButton>
+          <ToggleButton value="author">Author Style</ToggleButton>
+        </ToggleButtonGroup>
+
+        {styleMode === 'publisher' ? (
+          <Autocomplete
+            size="small"
+            options={publisherOptions}
+            value={selectedPublisher || null}
+            onChange={(_event, value) => setSelectedPublisher(value || '')}
+            renderInput={(params) => (
+              <TextField {...params} label="Publisher / Source Domain" placeholder="Select publisher style" />
+            )}
+          />
+        ) : (
+          <Autocomplete
+            size="small"
+            loading={authorsLoading}
+            options={authors}
+            value={selectedAuthor}
+            onChange={(_event, value) => setSelectedAuthor(value)}
+            getOptionLabel={(option) => option?.author_name ? `${option.author_name} (${option.article_count || 0})` : ''}
+            isOptionEqualToValue={(option, value) => option.author_id === value.author_id}
+            renderInput={(params) => (
+              <TextField {...params} label="Author Style" placeholder="Select author profile" />
+            )}
+          />
+        )}
+
+        <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
+          <Button
+            data-testid="generate-cluster-draft"
+            variant="contained"
+            startIcon={generation.loading ? <CircularProgress size={16} sx={{ color: '#fff' }} /> : <AutoAwesomeIcon />}
+            disabled={!canGenerate}
+            onClick={submit}
+          >
+            {generation.loading ? 'Generating Draft...' : 'Generate Draft'}
+          </Button>
+        </Box>
+
+        {generation.error && <Alert severity="error">{generation.error}</Alert>}
+
+        {generation.result && (
+          <Paper data-testid="generated-draft-panel" variant="outlined" sx={{ borderColor: '#e2e8f0', borderRadius: 2, overflow: 'hidden' }}>
+            <Box sx={{ p: 2, bgcolor: '#fbfdff', borderBottom: '1px solid #e2e8f0' }}>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} justifyContent="space-between" alignItems={{ xs: 'stretch', sm: 'center' }}>
+                <Box>
+                  <Typography sx={{ fontWeight: 800, color: '#0f172a' }}>Generated Draft</Typography>
+                  <Typography sx={{ color: '#64748b', fontSize: '0.78rem' }}>
+                    History ID {generation.result.generation_history_id || '-'} · {generation.result.style_mode} · {generation.result.model || 'Qwen'}
+                  </Typography>
+                </Box>
+                {generation.result.generation_error && (
+                  <Chip size="small" label="Generated with warning" sx={{ bgcolor: '#fff7ed', color: '#c2410c' }} />
+                )}
+              </Stack>
+            </Box>
+            <Box
+              sx={{
+                p: 2.25,
+                color: '#1e293b',
+                fontSize: '0.92rem',
+                lineHeight: 1.75,
+                '& h1,& h2,& h3': { color: '#0f172a', lineHeight: 1.35 },
+                '& h1': { fontSize: '1.25rem' },
+                '& h2': { fontSize: '1.12rem' },
+                '& h3': { fontSize: '1rem' },
+                '& p': { mt: 0, mb: 1.4 },
+              }}
+            >
+              <ReactMarkdown>{generation.result.generated_content || generation.result.factual_draft || ''}</ReactMarkdown>
+            </Box>
+          </Paper>
+        )}
+      </Stack>
+    </DetailSection>
+  )
+}
+
+function ClusterDetailPanel({
+  selectedCluster,
+  detailState,
+  authors,
+  authorsLoading,
+  generation,
+  onGenerate,
+}) {
   if (!selectedCluster) return <EmptyDetail />
 
   const { loading, error, detail, sources, articles, ragContext } = detailState
@@ -277,11 +424,14 @@ function ClusterDetailPanel({ selectedCluster, detailState, onContinue }) {
             </Stack>
           </DetailSection>
 
-          <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
-            <Button variant="contained" endIcon={<OpenInNewIcon />} onClick={onContinue}>
-              Continue to Style Selection
-            </Button>
-          </Box>
+          <GenerationPanel
+            selectedCluster={selectedCluster}
+            sources={sources}
+            authors={authors}
+            authorsLoading={authorsLoading}
+            generation={generation}
+            onGenerate={onGenerate}
+          />
         </>
       )}
     </Stack>
@@ -305,6 +455,9 @@ export default function UnifiedApp() {
     articles: [],
     ragContext: null,
   })
+  const [authors, setAuthors] = useState([])
+  const [authorsLoading, setAuthorsLoading] = useState(false)
+  const [generation, setGeneration] = useState({ loading: false, error: '', result: null })
 
   const currentStats = useMemo(() => ({
     articles: statValue(stats, lang, 'articles'),
@@ -329,6 +482,7 @@ export default function UnifiedApp() {
       setClusters(clustersData?.items || [])
       setSelectedCluster(null)
       setDetailState({ loading: false, error: '', detail: null, sources: [], articles: [], ragContext: null })
+      setGeneration({ loading: false, error: '', result: null })
     } catch (err) {
       if (err.response?.status === 401) {
         nav('/login', { replace: true })
@@ -343,6 +497,7 @@ export default function UnifiedApp() {
   const loadClusterDetail = async (cluster) => {
     setSelectedCluster(cluster)
     setDetailState({ loading: true, error: '', detail: null, sources: [], articles: [], ragContext: null })
+    setGeneration({ loading: false, error: '', result: null })
     try {
       const [detail, sources, articles, ragContext] = await Promise.all([
         getClusterDetail(cluster.id),
@@ -374,14 +529,42 @@ export default function UnifiedApp() {
     }
   }
 
+  const loadAuthors = async (selectedLang) => {
+    setAuthorsLoading(true)
+    try {
+      const data = await getAuthors(selectedLang)
+      setAuthors(data || [])
+    } catch {
+      setAuthors([])
+    } finally {
+      setAuthorsLoading(false)
+    }
+  }
+
   useEffect(() => {
     loadData(lang)
+    loadAuthors(lang)
   }, [])
 
   const handleLang = (_event, value) => {
     if (!value || value === lang) return
     setLang(value)
     loadData(value)
+    loadAuthors(value)
+  }
+
+  const handleGenerate = async (payload) => {
+    setGeneration({ loading: true, error: '', result: null })
+    try {
+      const result = await generateClusterDraft(payload)
+      setGeneration({ loading: false, error: '', result })
+    } catch (err) {
+      setGeneration({
+        loading: false,
+        error: err.response?.data?.detail || err.message || 'Draft generation failed.',
+        result: null,
+      })
+    }
   }
 
   return (
@@ -522,7 +705,10 @@ export default function UnifiedApp() {
             <ClusterDetailPanel
               selectedCluster={selectedCluster}
               detailState={detailState}
-              onContinue={() => {}}
+              authors={authors}
+              authorsLoading={authorsLoading}
+              generation={generation}
+              onGenerate={handleGenerate}
             />
           </Box>
         )}
