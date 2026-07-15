@@ -24,7 +24,7 @@ export default function Login() {
     try {
       const data = await login(form.username, form.password)
       saveSession(data)
-      nav(data.role === 'admin' ? '/admin' : '/user')
+      nav('/app')
     } catch (err) {
       setError(err.response?.data?.detail || 'Login failed')
     } finally {
