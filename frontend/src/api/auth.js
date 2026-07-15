@@ -10,6 +10,14 @@ authApi.interceptors.request.use(config => {
   return config
 })
 
+authApi.interceptors.response.use(
+  response => response,
+  error => {
+    if (error.response?.status === 401) clearSession()
+    return Promise.reject(error)
+  },
+)
+
 export const login    = (username, password) =>
   api.post('/auth/login',    { username, password }).then(r => r.data)
 
@@ -19,6 +27,7 @@ export const register = (username, email, password) =>
 export const saveSession  = (data) => localStorage.setItem('auth', JSON.stringify(data))
 export const getSession   = ()     => { try { return JSON.parse(localStorage.getItem('auth')) } catch { return null } }
 export const clearSession = ()     => localStorage.removeItem('auth')
+export { authApi }
 
 // ── User management ───────────────────────────────────────────────────────────
 

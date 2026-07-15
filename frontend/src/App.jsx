@@ -7,6 +7,7 @@ import Login   from './pages/Login'
 import Signup  from './pages/Signup'
 import Admin   from './pages/Admin'
 import User    from './pages/User'
+import UnifiedApp from './pages/UnifiedApp'
 import { getSession } from './api/auth'
 
 function ProtectedAdmin({ children }) {
@@ -23,6 +24,12 @@ function ProtectedUser({ children }) {
   return children
 }
 
+function ProtectedApp({ children }) {
+  const s = getSession()
+  if (!s) return <Navigate to="/login" replace />
+  return children
+}
+
 export default function App() {
   return (
     <ThemeProvider theme={theme}>
@@ -32,6 +39,7 @@ export default function App() {
           <Route path="/"       element={<Landing />} />
           <Route path="/login"  element={<Login />} />
           <Route path="/signup" element={<Signup />} />
+          <Route path="/app"    element={<ProtectedApp><UnifiedApp /></ProtectedApp>} />
           <Route path="/admin"  element={<ProtectedAdmin><Admin /></ProtectedAdmin>} />
           <Route path="/user"   element={<ProtectedUser><User /></ProtectedUser>} />
           <Route path="*"       element={<Navigate to="/" replace />} />
